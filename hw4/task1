@@ -1,0 +1,71 @@
+import statistics
+import time
+
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+
+def prepare_data() -> TensorDataset:
+    X = torch.randn(10000, 128)
+    y = torch.randint(0, 2, (10000,))
+    dataset = TensorDataset(X, y)
+    return dataset
+
+
+def train():
+    dataloader = DataLoader(prepare_data(), batch_size=256, shuffle=True)
+
+    model = nn.Sequential(
+        nn.Linear(128, 512), nn.ReLU(),
+        nn.Linear(512, 128), nn.ReLU(),
+        nn.Linear(128, 2)
+    ).cuda().train()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss()
+
+    losses_history = []
+    forward_times = []
+    backward_times = []
+
+    for batch_idx, (data, target) in enumerate(dataloader):
+
+        data = data.cuda(non_blocking=True) # не блокируем поток
+        target = target.cuda(non_blocking=True) # не блокируем поток
+        noise = torch.randn_like(data)  # генерируем сразу на gpu => убираем лишнее копирование
+
+        data = data + noise
+
+        optimizer.zero_grad()
+
+        # меняем логику подсчетов для замеров реального времени выполнения операций на GPU
+        fwd_start = torch.cuda.Event(enable_timing=True)
+        fwd_end = torch.cuda.Event(enable_timing=True)
+        fwd_start.record()
+        output = model(data)
+        loss = criterion(output, target)
+        fwd_end.record()
+        torch.cuda.synchronize() # гарантия, что все операции закончены
+        forward_times.append(fwd_start.elapsed_time(fwd_end) / 1000.0)# в секундах
+
+        # аналогичная логика для backward pass
+        bwd_start = torch.cuda.Event(enable_timing=True)
+        bwd_end = torch.cuda.Event(enable_timing=True)
+        bwd_start.record()
+        loss.backward()
+        bwd_end.record()
+        torch.cuda.synchronize()
+        backward_times.append(bwd_start.elapsed_time(bwd_end) / 1000.0)
+
+        losses_history.append(loss.item()) # хранение тензоров съедает память => сохраняем значение
+        print(f"Batch {batch_idx} loss: {loss.item():.4f}")
+
+        # удаляем, так как слишком медленный и тяжелый для вызова в конце каждого батча
+        # torch.cuda.empty_cache() 
+
+    print(f"Epoch finished, avg forward time is {statistics.mean(forward_times)}, "
+          f"avg backward time is {statistics.mean(backward_times)}")
+
+if __name__ == '__main__':
+    train()
