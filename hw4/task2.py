@@ -2,7 +2,7 @@ import functools
 import torch
 import triton
 import triton.language as tl
-from triton.testing import perf_report, Benchmark, do_bench
+from triton.testing import do_bench
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -44,7 +44,6 @@ def layernorm_fwd_kernel(
     tl.store(y_ptr + row * N + offs, y, mask=mask)
     tl.store(mean_ptr + row, mean)
     tl.store(rstd_ptr + row, rstd)
-
 
 # Backward kernel
 @triton.autotune(
@@ -88,52 +87,93 @@ def layernorm_bwd_kernel(
     tl.atomic_add(db_ptr + offs, dyhat, mask=mask)
 
 
-# Pytorch solution
+# Triton fwd + bwd
+class LayerNormTriton(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w, b, eps=1e-5):
+        if not x.is_contiguous():
+            x = x.contiguous()
+        M, N = x.shape
+        y = torch.empty_like(x)
+        mean = torch.empty(M, dtype=torch.float32, device=x.device)
+        rstd = torch.empty(M, dtype=torch.float32, device=x.device)
+
+        layernorm_fwd_kernel[(M,)](
+            x, w, b, y, mean, rstd,
+            N=N, eps=eps,
+        )
+        ctx.save_for_backward(x, w, b, mean, rstd)
+        ctx.eps = eps
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, w, b, mean, rstd = ctx.saved_tensors
+        eps = ctx.eps
+        if not dy.is_contiguous():
+            dy = dy.contiguous()
+        M, N = x.shape
+
+        dx = torch.empty_like(x)
+        dw = torch.zeros_like(w, dtype=torch.float32)
+        db = torch.zeros_like(b, dtype=torch.float32)
+
+        layernorm_bwd_kernel[(M,)](
+            x, w, dy, dx, dw, db, mean, rstd,
+            N=N,
+        )
+        return dx, dw.to(w.dtype), db.to(b.dtype), None
+
+
+# PyTorch solution
 def layernorm_forward_torch(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5):
     mean = x.mean(dim=-1, keepdim=True)
     var = x.var(dim=-1, unbiased=False, keepdim=True)
-    
     rstd = 1.0 / torch.sqrt(var + eps)
     x_hat = (x - mean) * rstd
-    
-    # 4. Применяем scale (weight) и shift (bias)
-    output = x_hat * weight + bias
-    
-    return output
-
-# Triton forward
-def layernorm_forward(x, w, b, eps=1e-5):
-    if not x.is_contiguous():
-        x = x.contiguous()
-    M, N = x.shape
-    y = torch.empty_like(x)
-    mean = torch.empty(M, dtype=torch.float32, device=x.device)
-    rstd = torch.empty(M, dtype=torch.float32, device=x.device)
-
-    layernorm_fwd_kernel[(M,)](
-        x, w, b, y, mean, rstd,
-        N=N, eps=eps,
-    )
-    return y, (x, w, b, mean, rstd)
-
-# Triton backward
-def layernorm_backward(dy, ctx):
-    x, w, b, mean, rstd = ctx
-    if not dy.is_contiguous():
-        dy = dy.contiguous()
-    M, N = x.shape
-
-    dx = torch.empty_like(x)
-    dw = torch.zeros_like(w, dtype=torch.float32)
-    db = torch.zeros_like(b, dtype=torch.float32)
-
-    layernorm_bwd_kernel[(M,)](
-        x, w, dy, dx, dw, db, mean, rstd,
-        N=N,
-    )
-    return dx, dw, db
+    return x_hat * weight + bias
 
 
+# Correctness test
+def test_correctness(dtype=torch.float32, atol=1e-5, rtol=1e-5):
+    M, N = 32, 1024
+    x = torch.randn(M, N, device='cuda', dtype=dtype)
+    w = torch.randn(N, device='cuda', dtype=dtype)
+    b = torch.randn(N, device='cuda', dtype=dtype)
+    eps = 1e-5
+
+    # Forward
+    y_torch = layernorm_forward_torch(x, w, b, eps)
+    y_triton = LayerNormTriton.apply(x, w, b, eps)
+
+    torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
+    print("Forward OK!")
+
+    # Backward
+    x.requires_grad_(True)
+    w.requires_grad_(True)
+    b.requires_grad_(True)
+
+    y_torch = layernorm_forward_torch(x, w, b, eps)
+    y_triton = LayerNormTriton.apply(x, w, b, eps)
+
+    grad_out = torch.randn_like(y_torch)
+
+    y_torch.backward(grad_out, retain_graph=True)
+    grad_x_torch, grad_w_torch, grad_b_torch = x.grad, w.grad, b.grad
+
+    x.grad, w.grad, b.grad = None, None, None
+    y_triton.backward(grad_out)
+    grad_x_triton, grad_w_triton, grad_b_triton = x.grad, w.grad, b.grad
+
+    if dtype == torch.bfloat16:
+        atol, rtol = 1e-2, 1e-2
+    torch.testing.assert_close(grad_x_triton, grad_x_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(grad_w_triton, grad_w_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(grad_b_triton, grad_b_torch, atol=atol, rtol=rtol)
+    print("Backward OK!")
+
+# Benchmark ig
 HIDDEN = 1024
 
 def make_inputs(n_elements, device="cuda", dtype=torch.bfloat16):
@@ -144,51 +184,28 @@ def make_inputs(n_elements, device="cuda", dtype=torch.bfloat16):
     b = torch.randn(N, device=device, dtype=dtype)
     return x, w, b
 
-_PROVIDER = {
-    "Triton": lambda x, w, b: layernorm_forward(x, w, b)[0],
-    "PyTorch": lambda x, w, b: layernorm_torch(x, w, b),
-    "PyTorch (compile)": torch.compile(lambda x, w, b: layernorm_torch(x, w, b)),
-}
-
-@perf_report(
-    Benchmark(
-        x_names=["n_elements"],
-        x_vals=[2**i for i in range(20, 26)],  # от ~1M до 32M элементов
-        line_arg="provider",
-        line_vals=list(_PROVIDER.keys()),
-        line_names=list(_PROVIDER.keys()),
-        styles=[("blue", "-"), ("red", "--"), ("green", "-.")],
-        ylabel="Latency (ms)",
-        plot_name="layernorm_forward_latency",
-        args={},
-    )
-)
-def benchmark(n_elements, provider):
-    x, w, b = make_inputs(n_elements)
-    fn = functools.partial(_PROVIDER[provider], x, w, b)
-    ms, min_ms, max_ms = do_bench(fn, quantiles=[0.5, 0.2, 0.8])
-    return ms, min_ms, max_ms
-
 
 def run_benchmark():
+    providers = {
+        "Triton": lambda x, w, b: LayerNormTriton.apply(x, w, b, eps=1e-5),
+        "PyTorch": lambda x, w, b: layernorm_forward_torch(x, w, b, eps=1e-5),
+        "PyTorch (compile)": torch.compile(lambda x, w, b: layernorm_forward_torch(x, w, b, eps=1e-5)),
+    }
+
     n_elements_list = [2**i for i in range(20, 26)]
-    results = {name: [] for name in _PROVIDER}
+    results = {name: [] for name in providers}
 
     for n in n_elements_list:
-        x, w, b = make_inputs(n)
-        for name, fn in _PROVIDER.items():
+        x, w, b = make_inputs(n, dtype=torch.bfloat16)
+        for name, fn in providers.items():
             fn_partial = functools.partial(fn, x, w, b)
-            ms, _, _ = do_bench(fn_partial, quantiles=[0.5])
+            ms = do_bench(fn_partial, quantiles=[0.5])[0]
             results[name].append(ms)
-
-    # Вывод ускорения
-    for i, n in enumerate(n_elements_list):
-        speedup = results["PyTorch"][i] / results["Triton"][i]
+        speedup = results["PyTorch"][-1] / results["Triton"][-1]
         print(f"n_elements={n:8d} : Triton speedup over PyTorch = {speedup:.2f}x")
 
 
 if __name__ == "__main__":
     test_correctness(dtype=torch.float32)
-    test_correctness(dtype=torch.bfloat16)
-
+    test_correctness(dtype=torch.bfloat16, atol=1e-2, rtol=1e-2)
     run_benchmark()
